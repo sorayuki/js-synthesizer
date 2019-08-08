@@ -1,0 +1,230 @@
+<html>
+    <head>
+        <script language="javascript">
+            // 解析简谱
+            function* parse_music_score(str_music_score) {
+                var bpm = 60;
+                var do_pos = -9; // 1=c
+                var notes_pos = new Array(NaN, 0, 2, 4, 5, 7, 9, 11); //1234567
+                var volume = 1.0;
+                var soundFont = "square";
+
+                var cur_notes_pos;
+                var restore_note_pos = function() {
+                    cur_notes_pos = new Array(notes_pos.length);
+                    for(var i = 0; i < notes_pos.length; ++i)
+                        cur_notes_pos[i] = notes_pos[i] + do_pos;
+                };
+                restore_note_pos();
+
+                for(var token of str_music_score.split(" ")) {
+                    if (token.length == 0)
+                        continue;
+                    
+                    if (token.startsWith("BPM=")) {
+                        bpm = Number.parseFloat(token.substring(4));
+                    } else if (token.startsWith("VOL=")) {
+                        volume = Number.parseInt(token.substring(4)) / 100.0;
+                    } else if (token.startsWith("1=")) {
+                        var do_pos_offset = 0;
+                        token.substring(2).split("").forEach(x => {
+                            if (x == "b") do_pos_offset = -1;
+                            else if (x == "#") do_pos_offset = 1;
+
+                            else if (x == "C") do_pos = -9;
+                            else if (x == "D") do_pos = -7;
+                            else if (x == "E") do_pos = -5;
+                            else if (x == "F") do_pos = -4;
+                            else if (x == "G") do_pos = -2;
+                            else if (x == "A") do_pos = 0;
+                            else if (x == "B") do_pos = 2;
+
+                            else if (x == "-") do_pos_offset -= 12;
+                            else if (x == "+") do_pos_offset += 12
+                        });
+                        do_pos += do_pos_offset;
+                    } else if (token == "square" || token == "triangle" || token == "noise") {
+                        soundFont = token;
+                    } else if (token == "|") {
+                        restore_note_pos();
+                    } else {
+                        var note_beat = 1;
+                        var note_pos_offset1 = null;
+                        var note_pos_offset2 = 0;
+                        var note = 0;
+
+                        token.split("").forEach(function(c) {
+                            if (c == "#") note_pos_offset1 = 1;
+                            else if (c == "b") note_pos_offset1 = -1;
+                            else if (c == "$") note_pos_offset1 = 0;
+
+                            else if (c == "_") note_beat /= 2;
+                            else if (c == "=") note_beat /= 4;
+                            else if (c == "+") note_pos_offset2 += 12;
+                            else if (c == "-") {
+                                if (note == 0)
+                                    note_pos_offset2 -= 12;
+                                else
+                                    note_beat *= 2;
+                            }
+                            else if (c == ".") note_beat *= 1.5;
+
+                            else if (c.charCodeAt(0) >= "0".charCodeAt(0) && c.charCodeAt(0) <= "7".charCodeAt(0)) {
+                                note = Number.parseInt(c);
+                                if (note_pos_offset1 != null) {
+                                    //apply # or b or $
+                                    cur_notes_pos[note] = notes_pos[note] + do_pos + note_pos_offset1;
+                                }
+                            }
+                        });
+
+                        yield {
+                            sound_font: soundFont,
+                            bpm: bpm,
+                            volume: volume,
+                            note_pos: cur_notes_pos[note] + note_pos_offset2,
+                            beat_len: note_beat
+                        };
+                    }
+                }
+            }
+
+            // 根据乐谱解析结果生成矩形波
+            function* getPCM(music_score, config) {
+                for(var x of music_score) {
+                    var sample_count = Math.round(x.beat_len * config.samplerate * 60 / x.bpm);
+                    var result = new Array(sample_count);
+                    result.fill(0);
+
+                    if (isNaN(x.note_pos) != true) {
+                        var freq = 440 * Math.pow(2, x.note_pos / 12);
+
+                        if (x.sound_font == "square") {
+                            for(var i = 0; i < sample_count; ++i) {
+                                if (Math.sin(2 * Math.PI * freq * i / config.samplerate) > 0)
+                                    result[i] = config.amplitude * x.volume;
+                                else
+                                    result[i] = -config.amplitude * x.volume;
+                            }
+                        } else if (x.sound_font == "triangle") {
+                            var cycle = config.samplerate / freq;
+                            var sample_delta = config.amplitude * 4 * x.volume / cycle;
+                            var j = 0;
+                            for(var i = 0; i < sample_count; ++i) {
+                                result[i] = j;
+                                j += sample_delta;
+                                if (j > config.amplitude || j < -config.amplitude)
+                                    sample_delta = -sample_delta;
+                            }
+                        } else if (x.sound_font == "noise") {
+                            // 鼓点长度为16分音符
+                            for(var i = 0; i < sample_count / 16; ++i) 
+                                result[i] = config.amplitude * (2 * Math.random() - 1) * x.volume;
+                        }
+                    }
+
+                    yield result;
+                }
+            }
+
+            // 多轨混音器
+            function* pcmMixer(pcm_array) {
+                pcm_array = pcm_array.map(function(x) { return {obj: x}; });
+                pcm_array.forEach(x => x.cur = x.obj.next());
+                for(;;) {
+                    pcm_array.filter(x => { return x.cur.value.length == 0; }).forEach(x => {x.cur = x.obj.next();});
+                    if (pcm_array.reduce((lhs, rhs) => { return lhs || rhs.cur.done; }, false))
+                        return;
+                    var min_len = pcm_array.reduce((lhs, rhs) => { return Math.min(lhs, rhs.cur.value.length); }, 9999999);
+                    var result = new Array(min_len);
+                    result.fill(0);
+                    pcm_array.forEach(x => {
+                        for(var i = 0; i < min_len; ++i)
+                            result[i] += x.cur.value[i] / pcm_array.length;
+                        x.cur.value = x.cur.value.slice(min_len);
+                    });
+                    yield result;
+                }
+            }
+
+            // 配置参数
+            function getDefaultConfig() {
+                return {
+                    amplitude: 1.0,
+                    samplerate: 48000
+                };
+            }
+        </script>
+    </head>
+    <body>
+        <div id="music_score_div">
+            <br />
+            <br />
+            <textarea id="music_score_ta_prototype" style="width: 600px; height: 80px">BPM=90 1=C | #+4_ +2_ 6_ +2_ +3_ +6_ +6 | +3_ #+4_ +3_ 6_ +2- |</textarea>
+            <br />
+            <br />
+            <textarea id="music_score_ta_prototype" style="width: 600px; height: 80px">BPM=90 VOL=40 1=C 0= | #+4_ +2_ 6_ +2_ +3_ +6_ +6 | +3_ #+4_ +3_ 6_ +2- |</textarea>
+            <br />
+            <br />
+            <textarea id="music_score_ta_prototype" style="width: 600px; height: 80px">BPM=90 VOL=20 1=C 0_ | #+4_ +2_ 6_ +2_ +3_ +6_ +6 | +3_ #+4_ +3_ 6_ +2- |</textarea>
+            <br />
+            <br />
+            <textarea id="music_score_ta_prototype" style="width: 600px; height: 80px">BPM=90 VOL=10 1=C 0_. | #+4_ +2_ 6_ +2_ +3_ +6_ +6 | +3_ #+4_ +3_ 6_ +2- |</textarea>
+            <br />
+            <br />
+            <textarea style="width: 600px; height: 80px">BPM=90 1=C | 0 #4 #+1. 6_ | 6 6_ 6_ #4- |</textarea>
+            <br />
+            <br />
+            <textarea style="width: 600px; height: 80px">BPM=90 VOL=200 noise | 2_ 2_ 2 2_ 2_ 2 | 2_ 2_ 2 2_ 2_ 2 |</textarea>
+        </div>
+
+        <script language="javascript">
+            function add_track() {
+                var div = document.getElementById("music_score_div");
+                var newNode = document.createElement("textarea");
+                newNode.setAttribute("style", document.getElementById("music_score_ta_prototype").getAttribute("style"));
+                div.append(document.createElement("br"));
+                div.append(document.createElement("br"));
+                div.append(newNode);
+            }
+            function btn_clk() {
+                var config = getDefaultConfig();
+                var pcm_tracks = Array.from(document
+                        .getElementById("music_score_div")
+                        .getElementsByTagName("textarea")
+                    )
+                    .map( ta_tag => { return ta_tag.value.trim(); })
+                    .map( ta_text => {
+                        if (ta_text.length > 0)
+                            return getPCM(
+                                parse_music_score(ta_text),
+                                config
+                            );
+                        else
+                            return null;
+                    } )
+                    .filter(x => { return x != null } );
+
+                var music_source = pcmMixer(pcm_tracks);
+
+                var r = [];
+                for(var i of music_source)
+                    r = r.concat(i);
+
+                var audioContext = new AudioContext();
+                var audioBuffer = audioContext.createBuffer(1, r.length, config.samplerate);
+                var channelBuffer = audioBuffer.getChannelData(0);
+                for (var i = 0; i < r.length; i++) {
+                        channelBuffer[i] = r[i];
+                }
+                var audioSource = audioContext.createBufferSource();
+                audioSource.buffer = audioBuffer;
+                audioSource.connect(audioContext.destination);
+                audioSource.start();
+            }
+        </script>
+        <br />
+        <button onclick="add_track()">添加轨道</button>
+        <button onclick="btn_clk()">听</button>
+    </body>
+</html>
